@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy import create_engine, Column, String, LargeBinary, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -19,6 +19,18 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 redis_client = redis.Redis(host="redis", port=os.getenv("REDIS_PORT"), password=os.getenv("REDIS_PASSWORD"), db=os.getenv("REDIS_DBNUMBER"))
+
+def get_cache(key):
+    """ Получить данные из кэша по ключу. """
+    cached_value = redis_client.get(key)
+    if cached_value:
+        return json.loads(cached_value)
+
+    return None
+
+def set_cache(key, value, expire=600):
+    """ Сериализовать данные в JSON и сохранить в кэш с определённым временем жизни (expire в секундах). """
+    redis_client.set(key, json.dumps(value), ex=expire)
 
 class Task(Base):
     __tablename__ = 'tasks'
@@ -45,18 +57,29 @@ async def generate_wordcloud(text: str):
     task_data = {'task_id': task_id, 'text': text}
     redis_client.rpush('wordcloud_tasks', json.dumps(task_data))
     
-    return JSONResponse(content={'status': 'queued', 'task_id': task_id})
+    return {'status': 'queued', 'task_id': task_id}
 
 @app.get("/api/wordcloud/status/{task_id}")
 async def get_wordcloud_status(task_id: str):
-    db = SessionLocal()
-    task = db.query(Task).filter(Task.task_id == task_id).first()
-    db.close()
-    
-    if task:
-        return JSONResponse(content={'task_id': task.task_id, 'status': task.status})
+    cache_key = f"item-{task_id}"
+    response = get_cache(cache_key)
+
+    if response:
+        response["from_cache"] = True
     else:
-        raise HTTPException(status_code=404, detail="Task not found")
+        db = SessionLocal()
+        task = db.query(Task).filter(Task.task_id == task_id).first()
+        db.close()
+
+        if task:
+            response = {'task_id': task.task_id, 'status': task.status}
+        else:
+            response = {'task_id': task_id, 'status': 'Task not found'}
+
+        set_cache(cache_key, response)
+        response["from_cache"] = False
+
+    return response
 
 @app.get("/api/wordcloud/{task_id}")
 async def download_wordcloud(task_id: str):
@@ -71,9 +94,9 @@ async def download_wordcloud(task_id: str):
             headers={"Content-Disposition": f"attachment; filename={task_id}.png"}
         )
     elif task:
-        return JSONResponse(content={'status': task.status, 'message': 'Word cloud not yet generated'}, status_code=202)
+        return {'status': task.status, 'message': 'Word cloud not yet generated'}, 202
     else:
-        raise HTTPException(status_code=404, detail="Task not found")
+        return {'status': 'Task not found'}, 404
 
 if __name__ == '__main__':
     import uvicorn
